@@ -1,0 +1,299 @@
+
+#![no_std]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+pub mod accessors;
+pub mod buffers;
+pub mod bus_operation;
+pub mod consts;
+pub mod utils;
+
+use accessors::*;
+use buffers::*;
+use bus_operation::*;
+use consts::*;
+use utils::*;
+
+use embedded_hal::{
+    i2c::{I2c, SevenBitAddress},
+    digital::OutputPin, 
+    delay::DelayNs
+};
+
+pub struct Vl53l4ed<B: BusOperation, XST: OutputPin, T: DelayNs> {
+    pub(crate) xshut_pin: XST,
+    pub(crate) bus: B,
+    pub(crate) tim: T,
+    pub(crate) chunk_size: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum Error<B> {
+    Bus(B),
+    Other,
+    Timeout,
+    Mcu,
+    Go2,
+    CorruptedFrame,
+    InvalidParam,
+    CheckSumFail
+}
+
+/// Packed reading results type
+#[repr(C)]
+pub struct ResultsData {
+    // Status of measurements. If the status is equal to 0, the data are valid
+    pub range_status: u8,
+    // Measured distance in mm 
+    pub distance_mm: u16,
+    // Ambient noise in kcps 
+    pub ambient_rate_kcps: u16,
+    // Ambient noise in kcps/SPAD 
+    pub ambient_per_spad_kcps: u16,
+    // Measured signal of the target in kcps 
+    pub signal_rate_kcps: u16,
+    // Measured signal of the target in kcps/SPAD 
+    pub signal_per_spad_kcps: u16,
+    // Number of SPADs enabled 
+    pub number_of_spad: u16,
+    // Estimated measurements std deviation in mm 
+    pub sigma_mm: u16,
+} 
+
+impl ResultsData {
+    pub fn new() -> Self {
+        ResultsData {
+            range_status: 0,
+            distance_mm: 0,
+            ambient_per_spad_kcps: 0,
+            ambient_rate_kcps: 0,
+            signal_rate_kcps: 0,
+            signal_per_spad_kcps: 0,
+            number_of_spad: 0,
+            sigma_mm: 0,
+        }
+    }
+}
+
+impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
+    /// Utility function to read data.
+    /// * Enough bytes of data are read starting from `reg`
+    /// to fill `rbuf`.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `reg` : specifies internal address register to be read.
+    /// * `rbuf` : array to fill with read bytes.
+    pub(crate) fn read_from_register(&mut self, reg: u16, rbuf: &mut [u8]) -> Result<(), Error<B::Error>> {
+        let size = rbuf.len();
+        let mut read_size: usize;
+        for i in (0..size).step_by(self.chunk_size) {
+            read_size = if size - i > self.chunk_size { self.chunk_size } else { size - i };
+            let a: u8 = (reg + i as u16 >> 8) as u8;
+            let b: u8 = (reg + i as u16 & 0xFF) as u8; 
+            self.bus.write_read(&[a, b], &mut rbuf[i..i+read_size]).map_err(Error::Bus)?;
+        }
+        Ok(())
+    }
+
+    /// Utility function to write data.
+    /// The content of `wbuf` is written in registers starting from `reg`.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `reg` : specifies internal address register to be overwritten.
+    /// * `wbuf` : values to be written.
+    pub(crate) fn write_to_register(&mut self, reg: u16, wbuf: &[u8]) -> Result<(), Error<B::Error>> {
+        let size = wbuf.len();
+        let mut write_size: usize;
+        let mut tmp: [u8; 32] = [0; 32];
+        for i in (0..size).step_by(self.chunk_size-2) {
+            write_size = if size - i > self.chunk_size-2 { self.chunk_size-2 } else { size - i };
+            tmp[0] = (reg + i as u16 >> 8) as u8;
+            tmp[1] = (reg + i as u16 & 0xFF) as u8;
+            tmp[2..2+write_size].copy_from_slice(&wbuf[i..i+write_size]);
+            self.bus.write(&tmp[..2+write_size]).map_err(Error::Bus)?;    
+        }   
+        Ok(())
+    }
+
+    /// Utility function to wait.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `ms` : milliseconds to wait.
+    pub(crate) fn delay(&mut self, ms: u32) {
+        self.tim.delay_ms(ms);
+    }
+
+    /// PowerOn the sensor
+    pub fn on(&mut self) -> Result<(), Error<B::Error>>{
+        self.xshut_pin.set_high().unwrap();
+        self.delay(10);
+        Ok(())
+    }
+
+    /// PowerOff the sensor
+    pub fn off(&mut self) -> Result<(), Error<B::Error>>{
+        self.xshut_pin.set_low().unwrap();
+        self.delay(10);
+        Ok(())
+    }
+    
+    /// This function is used to check the sensor id of VL53L4ED. The sensor id should be 0xEBAA.`
+    pub fn is_alive(&mut self) -> Result<(), Error<B::Error>> {
+        let mut rbuf: [u8; 2] = [0,0];  
+        self.read_from_register(VL53L4ED_IDENTIFICATION_MODEL_ID, &mut rbuf)?;
+        let device_id: u8 = rbuf[0];
+        let revision_id: u8 = rbuf[1];
+        if (device_id != 0xEC) || (revision_id != 0xAA) {
+            return Err(Error::Other);
+        }
+
+        Ok(())
+    }
+    
+    /// This function is used to initialize the sensor.
+    pub fn init(&mut self) -> Result<(), Error<B::Error>> {
+        let mut tmp: [u8; 1] = [0];
+        let mut i: u16 = 0;
+        loop {
+            self.read_from_register(VL53L4ED_FIRMWARE_SYSTEM_STATUS, &mut tmp)?;
+            if tmp[0] == 0x3 { // Sensor booted
+                break;
+            } else if i >= 1000 {
+                return Err(Error::Timeout);
+            }
+            i += 1;
+            self.delay(1);
+        }
+
+        // Load default configuration
+        self.write_to_register(0x2d, &VL53L4ED_DEFAULT_CONFIGURATION)?;
+
+        // Start VHV
+        self.write_to_register(VL53L4ED_SYSTEM_START, &[0x40])?;
+        i = 0;
+        loop {
+            if self.check_data_ready()? {
+                break;
+            } else if i >= 1000 {
+                return Err(Error::Timeout);
+            }
+            i += 1;
+            self.delay(1);
+        }
+
+        self.clear_interrupt()?;
+        self.stop_ranging()?;
+        self.write_to_register(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, &[0x09])?;
+        self.write_to_register(0x0b, &[0])?;
+        self.write_to_register(0x0024, &[5, 0])?;
+        self.set_range_timing(100, 0)?;
+
+        Ok(())
+    }
+
+    /// This function clears the interrupt. It needs to be called after a ranging data reading to arm the interrupt for the next data ready event.
+    pub fn clear_interrupt(&mut self) -> Result<(), Error<B::Error>> {
+        self.write_to_register(VL53L4ED_SYSTEM_INTERRUPT_CLEAR, &[0x01])?;
+
+        Ok(())
+    }
+
+    /// This function starts a ranging session. The ranging operation is continuous. The clear interrupt has to be done after each get data to allow the interrupt to raise when the next data is ready.
+    pub fn start_ranging(&mut self) -> Result<(), Error<B::Error>> {
+        let mut tmp: [u8; 4] = [0;4];
+        self.read_from_register(VL53L4ED_INTERMEASUREMENT_MS, &mut tmp)?;
+        let mut resolution: [u32; 1] = [0];
+        from_u8_to_u32(&tmp, &mut resolution);
+        if resolution[0] == 0 {
+            // Sensor runs in continuous mode 
+            self.write_to_register(VL53L4ED_SYSTEM_START, &[0x21])?;
+        } else {
+            // Sensor runs in autonomous mode 
+            self.write_to_register(VL53L4ED_SYSTEM_START, &[0x40])?;
+        }
+
+        Ok(())
+    }
+
+    /// This function stops the ranging session. 
+    /// It must be used when the sensor streams, after calling start_ranging().
+    pub fn stop_ranging(&mut self) -> Result<(), Error<B::Error>> {
+        self.write_to_register(VL53L4ED_SYSTEM_START, &[0x00])?;
+
+        Ok(())
+    }
+    
+    /// This function checks if a new data is ready by polling I2C. 
+    /// If a new data is ready, a flag will be raised.
+    /// 
+    /// # Return
+    /// 
+    /// * `isReady` : Value is false if data is not ready, 
+    /// or true if a new data is ready.
+    pub fn check_data_ready(&mut self) -> Result<bool, Error<B::Error>> {
+        let mut tmp: [u8; 1] = [0];
+        self.read_from_register(VL53L4ED_GPIO_HV_MUX_CTRL, &mut tmp)?;
+        tmp[0] = (tmp[0] & 0x10) >> 4;
+        let int_pol: u8 = if tmp[0] == 1 { 0 } else { 1 };
+        self.read_from_register(VL53L4ED_GPIO_TIO_HV_STATUS, &mut tmp)?;
+        let is_ready: bool = tmp[0] & 1 == int_pol;
+    
+        Ok(is_ready)
+    }
+
+    /// This function gets the ranging data, 
+    /// using the selected output and the resolution.
+    /// 
+    /// # Return
+    /// 
+    /// * `results` : VL53L7 results structure.
+    pub fn get_ranging_data(&mut self) -> Result<ResultsData, Error<B::Error>> {
+        let mut result: ResultsData = ResultsData::new();
+        let mut tmp8: [u8; 1] = [0];
+        let mut tmp16: [u8; 2] = [0; 2];
+        let mut buf16: [u16; 1] = [0];
+        let status_rtn: [u8; 24] = [
+            255, 255, 255,   5, 
+              2,   4,   1,   7, 
+              3,   0, 255, 255, 
+              9,  13, 255, 255, 
+            255, 255,  10,   6,
+            255, 255,  11,  12];
+
+        self.read_from_register(VL53L4ED_RESULT_RANGE_STATUS, &mut tmp8)?;
+        tmp8[0] &= 0x1f;
+        if tmp8[0] < 24 {
+            tmp8[0] = status_rtn[tmp8[0] as usize];
+        }
+        result.range_status = tmp8[0];
+
+        self.read_from_register(VL53L4ED_RESULT_SPAD_NB, &mut tmp16)?;
+        from_u8_to_u16(&tmp16, &mut buf16);
+        result.number_of_spad = buf16[0] / 256; 
+        
+        self.read_from_register(VL53L4ED_RESULT_SIGNAL_RATE, &mut tmp16)?;
+        from_u8_to_u16(&tmp16, &mut buf16);
+        result.signal_rate_kcps = buf16[0] * 8;
+        
+        self.read_from_register(VL53L4ED_RESULT_AMBIENT_RATE, &mut tmp16)?;
+        from_u8_to_u16(&tmp16, &mut buf16);
+        result.ambient_rate_kcps = buf16[0] * 8;
+
+        self.read_from_register(VL53L4ED_RESULT_SIGMA, &mut tmp16)?;
+        from_u8_to_u16(&tmp16, &mut buf16);
+        result.sigma_mm = buf16[0] / 4;
+
+        self.read_from_register(VL53L4ED_RESULT_DISTANCE, &mut tmp16)?;
+        from_u8_to_u16(&tmp16, &mut buf16);
+        result.distance_mm = buf16[0];
+
+        result.signal_per_spad_kcps = result.signal_rate_kcps / result.number_of_spad;
+        result.ambient_per_spad_kcps = result.ambient_rate_kcps / result.number_of_spad;
+
+        Ok(result)
+    }
+}
