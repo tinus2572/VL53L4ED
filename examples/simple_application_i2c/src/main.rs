@@ -88,7 +88,7 @@ fn main() -> ! {
     let address: SevenBitAddress = VL53L4ED_DEFAULT_I2C_ADDRESS;
         
     let mut sensor_top = Vl53l4ed::new_i2c(
-        RefCellDevice::new(&i2c_bus), 
+        RefCellDevice::new(&i2c_bus),  
             xshut_pin,
             tim_top
         ).unwrap();

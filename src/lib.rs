@@ -8,12 +8,14 @@ pub mod buffers;
 pub mod bus_operation;
 pub mod consts;
 pub mod utils;
+pub mod calibration;
 
 use accessors::*;
 use buffers::*;
 use bus_operation::*;
 use consts::*;
 use utils::*;
+use calibration::*;
 
 use embedded_hal::{
     i2c::{I2c, SevenBitAddress},
@@ -77,6 +79,47 @@ impl ResultsData {
 }
 
 impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
+    pub(crate) fn read_u8(&mut self, reg: u16) -> Result<u8, Error<B::Error>> {
+        let mut rbuf: [u8; 1] = [0];
+        self.read_from_register(reg, &mut rbuf)?;
+        Ok(rbuf[0])
+    }
+    
+    pub(crate) fn read_u16(&mut self, reg: u16) -> Result<u16, Error<B::Error>> {
+        let mut rbuf: [u8; 2] = [0; 2];
+        self.read_from_register(reg, &mut rbuf)?;
+        let mut val: [u16; 1] = [0];
+        from_u8_to_u16(&rbuf, &mut val);
+        Ok(val[0])
+    } 
+    
+    pub(crate) fn read_u32(&mut self, reg: u16) -> Result<u32, Error<B::Error>> {
+        let mut rbuf: [u8; 4] = [0; 4];
+        self.read_from_register(reg, &mut rbuf)?;
+        let mut val: [u32; 1] = [0];
+        from_u8_to_u32(&rbuf, &mut val);
+        Ok(val[0])
+    } 
+
+    pub(crate) fn write_u8(&mut self, reg: u16, val: u8) -> Result<(), Error<B::Error>> {
+        self.write_to_register(reg, &[val])?;
+        Ok(())
+    }
+
+    pub(crate) fn write_u16(&mut self, reg: u16, val: u16) -> Result<(), Error<B::Error>> {
+        let mut wbuf: [u8; 2] = [0; 2];
+        from_u16_to_u8(&[val], &mut wbuf);
+        self.write_to_register(reg, &wbuf)?;
+        Ok(())
+    }
+
+    pub(crate) fn write_u32(&mut self, reg: u16, val: u32) -> Result<(), Error<B::Error>> {
+        let mut wbuf: [u8; 4] = [0; 4];
+        from_u32_to_u8(&[val], &mut wbuf);
+        self.write_to_register(reg, &wbuf)?;
+        Ok(())
+    }
+
     /// Utility function to read data.
     /// * Enough bytes of data are read starting from `reg`
     /// to fill `rbuf`.
@@ -143,24 +186,20 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     
     /// This function is used to check the sensor id of VL53L4ED. The sensor id should be 0xEBAA.`
     pub fn is_alive(&mut self) -> Result<(), Error<B::Error>> {
-        let mut rbuf: [u8; 2] = [0,0];  
-        self.read_from_register(VL53L4ED_IDENTIFICATION_MODEL_ID, &mut rbuf)?;
-        let device_id: u8 = rbuf[0];
-        let revision_id: u8 = rbuf[1];
-        if (device_id != 0xEC) || (revision_id != 0xAA) {
+        let sensor_id: u16 = self.read_u16(VL53L4ED_IDENTIFICATION_MODEL_ID)?;
+        if sensor_id != 0xECAA {
             return Err(Error::Other);
         }
-
         Ok(())
     }
     
     /// This function is used to initialize the sensor.
     pub fn init(&mut self) -> Result<(), Error<B::Error>> {
-        let mut tmp: [u8; 1] = [0];
+        let mut tmp: u8;
         let mut i: u16 = 0;
         loop {
-            self.read_from_register(VL53L4ED_FIRMWARE_SYSTEM_STATUS, &mut tmp)?;
-            if tmp[0] == 0x3 { // Sensor booted
+            tmp = self.read_u8(VL53L4ED_FIRMWARE_SYSTEM_STATUS)?;
+            if tmp == 0x3 { // Sensor booted
                 break;
             } else if i >= 1000 {
                 return Err(Error::Timeout);
@@ -173,7 +212,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         self.write_to_register(0x2d, &VL53L4ED_DEFAULT_CONFIGURATION)?;
 
         // Start VHV
-        self.write_to_register(VL53L4ED_SYSTEM_START, &[0x40])?;
+        self.write_u8(VL53L4ED_SYSTEM_START,0x40)?;
         i = 0;
         loop {
             if self.check_data_ready()? {
@@ -187,9 +226,9 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
 
         self.clear_interrupt()?;
         self.stop_ranging()?;
-        self.write_to_register(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, &[0x09])?;
-        self.write_to_register(0x0b, &[0])?;
-        self.write_to_register(0x0024, &[5, 0])?;
+        self.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09)?;
+        self.write_u8(0x0b, 0)?;
+        self.write_u16(0x0024, 0x500)?;
         self.set_range_timing(100, 0)?;
 
         Ok(())
@@ -197,23 +236,20 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
 
     /// This function clears the interrupt. It needs to be called after a ranging data reading to arm the interrupt for the next data ready event.
     pub fn clear_interrupt(&mut self) -> Result<(), Error<B::Error>> {
-        self.write_to_register(VL53L4ED_SYSTEM_INTERRUPT_CLEAR, &[0x01])?;
+        self.write_u8(VL53L4ED_SYSTEM_INTERRUPT_CLEAR, 0x01)?;
 
         Ok(())
     }
 
     /// This function starts a ranging session. The ranging operation is continuous. The clear interrupt has to be done after each get data to allow the interrupt to raise when the next data is ready.
     pub fn start_ranging(&mut self) -> Result<(), Error<B::Error>> {
-        let mut tmp: [u8; 4] = [0;4];
-        self.read_from_register(VL53L4ED_INTERMEASUREMENT_MS, &mut tmp)?;
-        let mut resolution: [u32; 1] = [0];
-        from_u8_to_u32(&tmp, &mut resolution);
-        if resolution[0] == 0 {
+        let tmp: u32 = self.read_u32(VL53L4ED_INTERMEASUREMENT_MS)?;
+        if tmp == 0 {
             // Sensor runs in continuous mode 
-            self.write_to_register(VL53L4ED_SYSTEM_START, &[0x21])?;
+            self.write_u8(VL53L4ED_SYSTEM_START, 0x21)?;
         } else {
             // Sensor runs in autonomous mode 
-            self.write_to_register(VL53L4ED_SYSTEM_START, &[0x40])?;
+            self.write_u8(VL53L4ED_SYSTEM_START, 0x40)?;
         }
 
         Ok(())
@@ -222,7 +258,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// This function stops the ranging session. 
     /// It must be used when the sensor streams, after calling start_ranging().
     pub fn stop_ranging(&mut self) -> Result<(), Error<B::Error>> {
-        self.write_to_register(VL53L4ED_SYSTEM_START, &[0x00])?;
+        self.write_u8(VL53L4ED_SYSTEM_START, 0x00)?;
 
         Ok(())
     }
@@ -235,12 +271,11 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// * `isReady` : Value is false if data is not ready, 
     /// or true if a new data is ready.
     pub fn check_data_ready(&mut self) -> Result<bool, Error<B::Error>> {
-        let mut tmp: [u8; 1] = [0];
-        self.read_from_register(VL53L4ED_GPIO_HV_MUX_CTRL, &mut tmp)?;
-        tmp[0] = (tmp[0] & 0x10) >> 4;
-        let int_pol: u8 = if tmp[0] == 1 { 0 } else { 1 };
-        self.read_from_register(VL53L4ED_GPIO_TIO_HV_STATUS, &mut tmp)?;
-        let is_ready: bool = tmp[0] & 1 == int_pol;
+        let mut tmp: u8 = self.read_u8(VL53L4ED_GPIO_HV_MUX_CTRL)?;
+        tmp = (tmp & 0x10) >> 4;
+        let int_pol: u8 = if tmp == 1 { 0 } else { 1 };
+        tmp = self.read_u8(VL53L4ED_GPIO_TIO_HV_STATUS)?;
+        let is_ready: bool = tmp & 1 == int_pol;
     
         Ok(is_ready)
     }
@@ -253,9 +288,6 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// * `results` : VL53L7 results structure.
     pub fn get_ranging_data(&mut self) -> Result<ResultsData, Error<B::Error>> {
         let mut result: ResultsData = ResultsData::new();
-        let mut tmp8: [u8; 1] = [0];
-        let mut tmp16: [u8; 2] = [0; 2];
-        let mut buf16: [u16; 1] = [0];
         let status_rtn: [u8; 24] = [
             255, 255, 255,   5, 
               2,   4,   1,   7, 
@@ -264,32 +296,27 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
             255, 255,  10,   6,
             255, 255,  11,  12];
 
-        self.read_from_register(VL53L4ED_RESULT_RANGE_STATUS, &mut tmp8)?;
-        tmp8[0] &= 0x1f;
-        if tmp8[0] < 24 {
-            tmp8[0] = status_rtn[tmp8[0] as usize];
+        let mut tmp = self.read_u8(VL53L4ED_RESULT_RANGE_STATUS)?;
+        tmp &= 0x1f;
+        if tmp < 24 {
+            tmp = status_rtn[tmp as usize];
         }
-        result.range_status = tmp8[0];
+        result.range_status = tmp;
 
-        self.read_from_register(VL53L4ED_RESULT_SPAD_NB, &mut tmp16)?;
-        from_u8_to_u16(&tmp16, &mut buf16);
-        result.number_of_spad = buf16[0] / 256; 
+        let mut tmp = self.read_u16(VL53L4ED_RESULT_SPAD_NB)?;
+        result.number_of_spad = tmp / 256; 
         
-        self.read_from_register(VL53L4ED_RESULT_SIGNAL_RATE, &mut tmp16)?;
-        from_u8_to_u16(&tmp16, &mut buf16);
-        result.signal_rate_kcps = buf16[0] * 8;
+        tmp = self.read_u16(VL53L4ED_RESULT_SIGNAL_RATE)?;
+        result.signal_rate_kcps = tmp * 8;
         
-        self.read_from_register(VL53L4ED_RESULT_AMBIENT_RATE, &mut tmp16)?;
-        from_u8_to_u16(&tmp16, &mut buf16);
-        result.ambient_rate_kcps = buf16[0] * 8;
+        tmp = self.read_u16(VL53L4ED_RESULT_AMBIENT_RATE)?;
+        result.ambient_rate_kcps = tmp * 8;
 
-        self.read_from_register(VL53L4ED_RESULT_SIGMA, &mut tmp16)?;
-        from_u8_to_u16(&tmp16, &mut buf16);
-        result.sigma_mm = buf16[0] / 4;
+        tmp = self.read_u16(VL53L4ED_RESULT_SIGMA)?;
+        result.sigma_mm = tmp / 4;
 
-        self.read_from_register(VL53L4ED_RESULT_DISTANCE, &mut tmp16)?;
-        from_u8_to_u16(&tmp16, &mut buf16);
-        result.distance_mm = buf16[0];
+        tmp = self.read_u16(VL53L4ED_RESULT_DISTANCE)?;
+        result.distance_mm = tmp;
 
         result.signal_per_spad_kcps = result.signal_rate_kcps / result.number_of_spad;
         result.ambient_per_spad_kcps = result.ambient_rate_kcps / result.number_of_spad;
