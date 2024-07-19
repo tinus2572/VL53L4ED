@@ -1,13 +1,22 @@
+use core::iter::OnceWith;
+
 use consts::*;
 use stm32f4xx_hal::{pac::tim11::or::OR_SPEC, rtc::Lse};
 use utils::*;
 
 use crate::{consts, utils, BusOperation, Vl53l4ed, Error, OutputPin, DelayNs};
 
+#[repr(u8)]
+pub enum ThresholdWindow {
+    Below = 0,
+    Above = 1,
+    Out = 2,
+    In = 3
+}
 pub struct DetectionThresholds{
-    distance_high_mm: u16, 
-    distance_low_mm: u16, 
-    window: u8
+    pub distance_high_mm: u16, 
+    pub distance_low_mm: u16, 
+    pub window: ThresholdWindow
 }
 
 impl DetectionThresholds {
@@ -15,7 +24,7 @@ impl DetectionThresholds {
         DetectionThresholds { 
             distance_high_mm: 0,
             distance_low_mm: 0,
-            window: 0
+            window: ThresholdWindow::Below
         }
     }
 }
@@ -56,7 +65,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         macro_period_us = (2304 * (0x40000000 / osc_frequency as u32)) >> 6;
         ls_byte = (range_config_macrop_high as u32 & 0x00ff) << 4;
         ms_byte = (range_config_macrop_high as u32 & 0xff00) >> 8;
-        ms_byte = 0x04 - (ms_byte - 1) - 1;
+        ms_byte = 0x04 - ms_byte; // 0x04 - (ms_byte - 1) - 1;
 
         macro_period_us *= 16;
         timing_budget_ms = (((ls_byte + 1) * (macro_period_us >> 6)) - ((macro_period_us >> 6) >> 1)) >> 12;
@@ -108,7 +117,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
 
         // Sensor runs in continuous mode 
         if inter_measurement_ms == 0 {
-            self.write_u8(VL53L4ED_INTERMEASUREMENT_MS, 0)?;
+            self.write_u32(VL53L4ED_INTERMEASUREMENT_MS, 0)?;
             timing_budget_us -= 2500;
         }
 
@@ -204,7 +213,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     pub fn set_xtalk(&mut self, xtalk: u16) -> Result<(), Error<B::Error>> {
         self.write_u16(VL53L4ED_XTALK_X_PLANE_GRADIENT_KCPS, 0)?;
         self.write_u16(VL53L4ED_XTALK_Y_PLANE_GRADIENT_KCPS, 0)?;
-        self.write_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS, xtalk)?;
+        self.write_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS, xtalk << 9)?;
         Ok(())
     }
 
@@ -222,7 +231,13 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         let mut thresholds: DetectionThresholds = DetectionThresholds::new();
         thresholds.distance_high_mm = self.read_u16(VL53L4ED_THRESH_HIGH)?;
         thresholds.distance_low_mm = self.read_u16(VL53L4ED_THRESH_LOW)?;
-        thresholds.window = self.read_u8(VL53L4ED_SYSTEM_INTERRUPT)?;
+        thresholds.window =  match self.read_u8(VL53L4ED_SYSTEM_INTERRUPT)? {
+            0 => ThresholdWindow::Below,
+            1 => ThresholdWindow::Above,
+            2 => ThresholdWindow::Out,
+            3 => ThresholdWindow::In,
+            _ => return Err(Error::Other)
+        };
 
         Ok(thresholds)
     }
@@ -240,7 +255,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     pub fn set_detection_thresholds(&mut self, thresholds: DetectionThresholds) -> Result<(), Error<B::Error>> {
         self.write_u16(VL53L4ED_THRESH_HIGH, thresholds.distance_high_mm)?;
         self.write_u16(VL53L4ED_THRESH_LOW, thresholds.distance_low_mm)?;
-        self.write_u8(VL53L4ED_SYSTEM_INTERRUPT, thresholds.window)?;
+        self.write_u8(VL53L4ED_SYSTEM_INTERRUPT, thresholds.window as u8)?;
 
         Ok(())
     }
@@ -293,11 +308,11 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     }
 
     /// This function can be called when the temperature might have changed by more than 8 degrees Celsius. The function can only be used if the sensor is not ranging, otherwise, the ranging needs to be stopped using function 'stop_ranging()'. After calling this function, the ranging can restart normally.
-    pub fn set_temperature_update(&mut self) -> Result<(), Error<B::Error>> {
+    pub fn start_temperature_update(&mut self) -> Result<(), Error<B::Error>> {
         self.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x81)?;
         self.write_u8(0x0b, 0x92)?;
-        self.write_u8(VL53L4ED_SYSTEM_START, 0x40)?;
-
+        // self.write_u8(VL53L4ED_SYSTEM_START, 0x40)?;
+        self.start_ranging()?;
         let mut i: u16 = 0;
         loop {
             if self.check_data_ready()? { // Data ready

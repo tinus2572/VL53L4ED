@@ -95,6 +95,8 @@ fn main() -> ! {
 
     sensor_top.init_sensor(address).unwrap(); 
     sensor_top.set_range_timing(10, 0).unwrap();
+    let o = sensor_top.calibration_offset(100, 20).unwrap();
+    let x = sensor_top.calibration_xtalk(100, 20).unwrap();
     sensor_top.start_ranging().unwrap();
     
     loop {
