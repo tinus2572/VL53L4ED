@@ -4,7 +4,8 @@
 use vl53l4ed::{
     consts::VL53L4ED_DEFAULT_I2C_ADDRESS,
     Vl53l4ed, 
-    ResultsData
+    ResultsData,
+    bus_operation::Vl53l4edI2C
 };
 
 use panic_halt as _; 
@@ -48,6 +49,12 @@ fn write_results(tx: &mut Tx<USART2>, results: &ResultsData) {
         sig = results.signal_per_spad_kcps).unwrap();
 }
 
+fn take_inst(sensor: &mut Vl53l4ed<Vl53l4edI2C<RefCellDevice<StmI2c<I2C1>>>, Pin<'B', 3, Output>, Delay<TIM1, 1000>>, tx: &mut Tx<USART2>) {
+    while !sensor.check_data_ready().unwrap() {} // Wait for data to be ready
+    sensor.clear_interrupt().unwrap();
+    let results = sensor.get_ranging_data().unwrap(); // Get and parse the result data
+    write_results(tx, &results); // Print the result to the output
+}
 
 #[entry]
 fn main() -> ! {
@@ -87,7 +94,7 @@ fn main() -> ! {
     let i2c_bus: RefCell<StmI2c<I2C1>> = RefCell::new(i2c);
     let address: SevenBitAddress = VL53L4ED_DEFAULT_I2C_ADDRESS;
         
-    let mut sensor_top = Vl53l4ed::new_i2c(
+    let mut sensor_top: Vl53l4ed<Vl53l4edI2C<RefCellDevice<StmI2c<I2C1>>>, Pin<'B', 3, Output>, Delay<TIM1, 1000>> = Vl53l4ed::new_i2c(
         RefCellDevice::new(&i2c_bus),  
             xshut_pin,
             tim_top
@@ -95,15 +102,10 @@ fn main() -> ! {
 
     sensor_top.init_sensor(address).unwrap(); 
     sensor_top.set_range_timing(10, 0).unwrap();
-    let o = sensor_top.calibration_offset(100, 20).unwrap();
-    let x = sensor_top.calibration_xtalk(100, 20).unwrap();
     sensor_top.start_ranging().unwrap();
-    
+
     loop {
-        while !sensor_top.check_data_ready().unwrap() {} // Wait for data to be ready
-        sensor_top.clear_interrupt().unwrap();
-        results = sensor_top.get_ranging_data().unwrap(); // Get and parse the result data
-        write_results(&mut tx, &results); // Print the result to the output
+        take_inst(&mut sensor_top, &mut tx);
     }
 
 } 
