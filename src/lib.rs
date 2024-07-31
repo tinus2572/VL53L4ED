@@ -265,7 +265,7 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         Ok(())
     }
     
-    /// This function is used to check the sensor id of VL53L4ED. The sensor id should be 0xEBAA.`
+    /// This function is used to check the sensor id of VL53L4ED. The sensor id should be 0xECAA.`
     pub fn is_alive(&mut self) -> Result<(), Error<B::Error>> {
         let sensor_id: u16 = self.read_u16(VL53L4ED_IDENTIFICATION_MODEL_ID)?;
         if sensor_id != 0xECAA {
