@@ -27,3 +27,8 @@ bench = false
 codegen-units = 1 # better optimizations
 debug = true # symbols are nice and they don't increase the size on Flash
 lto = true # better optimizations
+
+# If the macro below is defined, the device will be programmed to run
+# with I2C Fast Mode Plus (up to 1MHz). Otherwise, default max value is 400kHz.
+[features]
+VL53L4ED_I2C_FAST_MODE_PLUS = []
