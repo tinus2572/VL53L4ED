@@ -104,7 +104,25 @@ use embedded_hal::{
     delay::DelayNs
 };
 
-pub struct Vl53l4ed<B: BusOperation, XST: OutputPin, T: DelayNs> {
+extern crate alloc;
+use alloc::boxed::Box;
+use core::marker::PhantomData;
+
+// Define the states
+pub struct Uninitialized;
+pub struct Initialized;
+pub struct Ranging;
+
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+
+// Define the Sensor with a state
+struct Vl53l4ed<State, B: BusOperation, XST: OutputPin, T: DelayNs> {
+    data: Box<Vl53l4edData<B, XST, T>>,
+    state: PhantomData<State>,
+}
+
+pub struct Vl53l4edData<B: BusOperation, XST: OutputPin, T: DelayNs> {
     pub(crate) xshut_pin: XST,
     pub(crate) bus: B,
     pub(crate) tim: T,
@@ -159,7 +177,7 @@ impl ResultsData {
     }
 }
 
-impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
+impl<State, B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<State, B, XST, T> {
     pub(crate) fn read_u8(&mut self, reg: u16) -> Result<u8, Error<B::Error>> {
         let mut rbuf: [u8; 1] = [0];
         self.read_from_register(reg, &mut rbuf)?;
@@ -212,11 +230,11 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     pub(crate) fn read_from_register(&mut self, reg: u16, rbuf: &mut [u8]) -> Result<(), Error<B::Error>> {
         let size = rbuf.len();
         let mut read_size: usize;
-        for i in (0..size).step_by(self.chunk_size) {
-            read_size = if size - i > self.chunk_size { self.chunk_size } else { size - i };
+        for i in (0..size).step_by(self.data.chunk_size) {
+            read_size = if size - i > self.data.chunk_size { self.data.chunk_size } else { size - i };
             let a: u8 = (reg + i as u16 >> 8) as u8;
             let b: u8 = (reg + i as u16 & 0xFF) as u8; 
-            self.bus.write_read(&[a, b], &mut rbuf[i..i+read_size]).map_err(Error::Bus)?;
+            self.data.bus.write_read(&[a, b], &mut rbuf[i..i+read_size]).map_err(Error::Bus)?;
         }
         Ok(())
     }
@@ -232,12 +250,12 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         let size = wbuf.len();
         let mut write_size: usize;
         let mut tmp: [u8; 32] = [0; 32];
-        for i in (0..size).step_by(self.chunk_size-2) {
-            write_size = if size - i > self.chunk_size-2 { self.chunk_size-2 } else { size - i };
+        for i in (0..size).step_by(self.data.chunk_size-2) {
+            write_size = if size - i > self.data.chunk_size-2 { self.data.chunk_size-2 } else { size - i };
             tmp[0] = (reg + i as u16 >> 8) as u8;
             tmp[1] = (reg + i as u16 & 0xFF) as u8;
             tmp[2..2+write_size].copy_from_slice(&wbuf[i..i+write_size]);
-            self.bus.write(&tmp[..2+write_size]).map_err(Error::Bus)?;    
+            self.data.bus.write(&tmp[..2+write_size]).map_err(Error::Bus)?;    
         }   
         Ok(())
     }
@@ -248,19 +266,19 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// 
     /// * `ms` : milliseconds to wait.
     pub(crate) fn delay(&mut self, ms: u32) {
-        self.tim.delay_ms(ms);
+        self.data.tim.delay_ms(ms);
     }
 
     /// PowerOn the sensor
     pub fn on(&mut self) -> Result<(), Error<B::Error>>{
-        self.xshut_pin.set_high().unwrap();
+        self.data.xshut_pin.set_high().unwrap();
         self.delay(10);
         Ok(())
     }
 
     /// PowerOff the sensor
     pub fn off(&mut self) -> Result<(), Error<B::Error>>{
-        self.xshut_pin.set_low().unwrap();
+        self.data.xshut_pin.set_low().unwrap();
         self.delay(10);
         Ok(())
     }
@@ -273,9 +291,12 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         }
         Ok(())
     }
-    
+}
+
+impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<Uninitialized, B, XST, T> {
+
     /// This function is used to initialize the sensor.
-    pub fn init(&mut self) -> Result<(), Error<B::Error>> {
+    pub fn pre_init(mut self) -> Result<Vl53l4ed<Initialized, B, XST, T>, Error<B::Error>> {
         let mut tmp: u8;
         let mut i: u16 = 0;
         loop {
@@ -292,38 +313,17 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         // Load default configuration
         self.write_to_register(0x2d, &VL53L4ED_DEFAULT_CONFIGURATION)?;
 
-        // Start VHV
-        self.write_u8(VL53L4ED_SYSTEM_START,0x40)?;
-        i = 0;
-        loop {
-            if self.check_data_ready()? {
-                break;
-            } else if i >= 1000 {
-                return Err(Error::Timeout);
-            }
-            i += 1;
-            self.delay(1);
-        }
-
-        self.clear_interrupt()?;
-        self.stop_ranging()?;
-        self.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09)?;
-        self.write_u8(0x0b, 0)?;
-        self.write_u16(0x0024, 0x500)?;
-        self.set_range_timing(100, 0)?;
-
-        Ok(())
+        Ok(Vl53l4ed {
+            data: self.data,
+            state: PhantomData
+        })
     }
+}
 
-    /// This function clears the interrupt. It needs to be called after a ranging data reading to arm the interrupt for the next data ready event.
-    pub fn clear_interrupt(&mut self) -> Result<(), Error<B::Error>> {
-        self.write_u8(VL53L4ED_SYSTEM_INTERRUPT_CLEAR, 0x01)?;
-
-        Ok(())
-    }
+impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<Initialized, B, XST, T> {
 
     /// This function starts a ranging session. The ranging operation is continuous. The clear interrupt has to be done after each get data to allow the interrupt to raise when the next data is ready.
-    pub fn start_ranging(&mut self) -> Result<(), Error<B::Error>> {
+    pub fn start_ranging(mut self) -> Result<Vl53l4ed<Ranging, B, XST, T>, Error<B::Error>> {
         let tmp: u32 = self.read_u32(VL53L4ED_INTERMEASUREMENT_MS)?;
         if tmp == 0 {
             // Sensor runs in continuous mode 
@@ -333,17 +333,56 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
             self.write_u8(VL53L4ED_SYSTEM_START, 0x40)?;
         }
 
-        Ok(())
+        Ok(Vl53l4ed { 
+            data: self.data,
+            state: PhantomData
+        })
     }
+    pub fn init(self) -> Result<Vl53l4ed<Initialized, B, XST, T>, Error<B::Error>> {
+        
+        // Start VHV
+        let mut s = self.start_ranging()?;
+        let mut i = 0;
+        loop {
+            if s.check_data_ready()? {
+                break;
+            } else if i >= 1000 {
+                return Err(Error::Timeout);
+            }
+            i += 1;
+            s.delay(1);
+        }
+        
+        s.clear_interrupt()?;
+        let mut s = s.stop_ranging()?;
+        s.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09)?;
+        s.write_u8(0x0b, 0)?;
+        s.write_u16(0x0024, 0x500)?;
+        let timing_budget_ms = TimingBudgetMs::new(100).expect("Timing OOB");
+        s.set_range_timing(RangeTiming {timing_budget_ms, inter_measurement_ms: 0})?;
+        Ok(s)
+    }
+}
 
+impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<Ranging, B, XST, T> {
     /// This function stops the ranging session. 
     /// It must be used when the sensor streams, after calling start_ranging().
-    pub fn stop_ranging(&mut self) -> Result<(), Error<B::Error>> {
+    pub fn stop_ranging(mut self) -> Result<Vl53l4ed<Initialized, B, XST, T>, Error<B::Error>> {
         self.write_u8(VL53L4ED_SYSTEM_START, 0x00)?;
+
+        Ok(Vl53l4ed { 
+            data: self.data,
+            state: PhantomData
+        })
+    }
+    
+    /// This function clears the interrupt. It needs to be called after a ranging data reading to arm the interrupt for the next data ready event.
+    pub fn clear_interrupt(&mut self) -> Result<(), Error<B::Error>> {
+        self.write_u8(VL53L4ED_SYSTEM_INTERRUPT_CLEAR, 0x01)?;
 
         Ok(())
     }
-    
+
     /// This function checks if a new data is ready by polling I2C. 
     /// If a new data is ready, a flag will be raised.
     /// 

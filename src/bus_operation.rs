@@ -1,5 +1,5 @@
 use consts::*;
-use crate::{consts, Vl53l4ed, Error, SevenBitAddress, I2c, OutputPin, DelayNs};
+use crate::{consts, Vl53l4ed, Vl53l4edData, Uninitialized, Initialized, Box, PhantomData, Error, SevenBitAddress, I2c, OutputPin, DelayNs};
 
 pub trait BusOperation {
     type Error;
@@ -44,7 +44,7 @@ impl<P: I2c> BusOperation for Vl53l4edI2C<P> {
     }
 }
 
-impl<P, XST, T> Vl53l4ed<Vl53l4edI2C<P>, XST, T>
+impl<P, XST, T> Vl53l4ed<Uninitialized, Vl53l4edI2C<P>, XST, T>
     where
     P: I2c,
     XST: OutputPin,
@@ -53,29 +53,31 @@ impl<P, XST, T> Vl53l4ed<Vl53l4edI2C<P>, XST, T>
     pub fn new_i2c(i2c: P, xshut_pin: XST, tim: T) -> Result<Self, Error<P::Error>> 
     {
         Ok(Vl53l4ed { 
-            xshut_pin: xshut_pin,
-            bus: Vl53l4edI2C::new(i2c),
-            tim: tim,
-            chunk_size: I2C_CHUNK_SIZE
-        })
+            data: Box::new(Vl53l4edData { 
+                xshut_pin: xshut_pin,
+                bus: Vl53l4edI2C::new(i2c),
+                tim: tim,
+                chunk_size: I2C_CHUNK_SIZE}),
+            state: PhantomData})
     }
     
     pub fn set_i2c_address(&mut self, i2c_address: SevenBitAddress) -> Result<(), Error<P::Error>> {
         self.write_to_register(VL53L4ED_I2C_SLAVE_DEVICE_ADDRESS, &[i2c_address])?;
-        self.bus.address = i2c_address;
+        self.data.bus.address = i2c_address;
         
         Ok(())
     }
 
-    pub fn init_sensor(&mut self, address: u8) -> Result<(), Error<P::Error>>{
+    pub fn init_sensor(mut self, address: u8) -> Result<Vl53l4ed<Initialized, Vl53l4edI2C<P>, XST, T>, Error<P::Error>>{
         self.off()?;
         self.on()?;
-        if address != self.bus.address {
+        if address != self.data.bus.address {
             self.set_i2c_address(address)?;
         }
         self.is_alive()?;
-        self.init()?;
-        Ok(())
+        let s = self.pre_init()?; 
+        let s = s.init()?; 
+        Ok(s)
     }
 }
 

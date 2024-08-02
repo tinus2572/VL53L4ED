@@ -4,7 +4,7 @@ use consts::*;
 use stm32f4xx_hal::{pac::tim11::or::OR_SPEC, rtc::Lse};
 use utils::*;
 
-use crate::{consts, utils, BusOperation, Vl53l4ed, Error, OutputPin, DelayNs};
+use crate::{consts, utils, BusOperation, Initialized, Vl53l4ed, Error, OutputPin, DelayNs, FromPrimitive};
 
 #[repr(u8)]
 pub enum ThresholdWindow {
@@ -29,14 +29,73 @@ impl DetectionThresholds {
     }
 }
 
-impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
+#[repr(C)]
+pub struct RangeTiming {
+    pub timing_budget_ms: TimingBudgetMs,
+    pub inter_measurement_ms: u32
+}
+
+#[derive(Debug, Clone, Copy, FromPrimitive, PartialEq)]
+pub struct TimingBudgetMs(u32);
+
+pub struct Offset(i16);
+
+pub struct Xtalk(u16);
+
+pub trait Bounded<T> {
+    const MIN: T;
+    const MAX: T;
+
+    fn new(value: T) -> Option<Self> where Self: Sized;
+}
+
+impl Bounded<u32> for TimingBudgetMs { 
+    const MIN: u32 = 10;
+    const MAX: u32 = 200;
+    
+    fn new(value: u32) -> Option<Self> where Self: Sized {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(TimingBudgetMs(value))
+        } else {
+            None
+        }
+    }
+}
+
+impl Bounded<i16> for Offset { 
+    const MIN: i16 = -1024;
+    const MAX: i16 = 1023;
+    
+    fn new(value: i16) -> Option<Self> where Self: Sized {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Offset(value))
+        } else {
+            None
+        }
+    }
+}
+
+impl Bounded<u16> for Xtalk { 
+    const MIN: u16 = 0;
+    const MAX: u16 = 128;
+    
+    fn new(value: u16) -> Option<Self> where Self: Sized {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Xtalk(value))
+        } else {
+            None
+        }
+    }
+}
+
+impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<Initialized, B, XST, T> {
 
     /// This function gets the current range timing. Timing are composed of TimingBudget and InterMeasurement. TimingBudget represents the timing during VCSEL enabled, and InterMeasurement the time between two measurements. The sensor can have different ranging mode depending of the configuration, please refer to the user manual for more information.
     /// 
     /// # Return
     /// 
     /// * `[timing_budget_ms, inter_measurement_ms]` :  Array containing the current timing budget in ms and the current inter-measurement in ms.
-    pub fn get_range_timing(&mut self) -> Result<[u32; 2], Error<B::Error>> {
+    pub fn get_range_timing(&mut self) -> Result<RangeTiming, Error<B::Error>> {
         let mut timing_budget_ms: u32;
         let mut inter_measurement_ms: u32;
 
@@ -82,8 +141,9 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         }
         timing_budget_ms /= 1000;
 
-        let arr: [u32; 2] = [timing_budget_ms, inter_measurement_ms];
-        Ok(arr)
+        let timing_budget_ms: TimingBudgetMs = TimingBudgetMs::new(timing_budget_ms).expect("Timing OOB");
+
+        Ok(RangeTiming {timing_budget_ms, inter_measurement_ms})
     }
 
     /// This function sets new range timing. Timing are composed of TimingBudget and InterMeasurement. TimingBudget represents the timing during VCSEL enabled, and InterMeasurement the time between two measurements. The sensor can have different ranging mode depending of the configuration, please refer to the user manual for more information.
@@ -92,7 +152,9 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// 
     /// * `timing_budget_ms` :  New timing budget in ms. Value can be between 10ms and 200ms. Default is 50ms.
     /// * `inter_measurement_ms` :  New inter-measurement in ms. If the value is equal to 0, the ranging period is defined by the timing budget.Otherwise, inter-measurement must be > timing budget. When all the timing budget is consumed, the device goes in low power mode until inter-measurement is done.
-    pub fn set_range_timing(&mut self, timing_budget_ms: u32, inter_measurement_ms: u32) -> Result<(), Error<B::Error>> {
+    pub fn set_range_timing(&mut self, range_timing: RangeTiming) -> Result<(), Error<B::Error>> {
+        let timing_budget_ms: u32 = range_timing.timing_budget_ms.0;
+        let inter_measurement_ms: u32 = range_timing.inter_measurement_ms;
         let osc_frequency: u16;
         let mut clock_pll: u16;
         let mut timing_budget_us: u32;
@@ -109,11 +171,6 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
         } else {
             return Err(Error::InvalidParam);
         }
-  
-        // Timing budget check validity 
-        if timing_budget_ms < 10 || timing_budget_ms > 200 {
-            return Err(Error::InvalidParam);
-        } 
 
         // Sensor runs in continuous mode 
         if inter_measurement_ms == 0 {
@@ -170,13 +227,14 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// # Return
     /// 
     /// * `offset` :  Offset value in millimeters. The minimum value is -1024mm and maximum is 1023mm.
-    pub fn get_offset(&mut self) -> Result<i16, Error<B::Error>> {
+    pub fn get_offset(&mut self) -> Result<Offset, Error<B::Error>> {
         let mut tmp = self.read_u16(VL53L4ED_RANGE_OFFSET_MM)?;
         tmp = (tmp << 3) >> 5;
         let mut offset = tmp as i16;
         if offset > 1024 {
             offset -= 2048;
         }
+        let offset: Offset = Offset::new(offset).expect("Offset OOB");
         Ok(offset)
     }
 
@@ -185,8 +243,8 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// # Arguments
     /// 
     /// * `offset` :  Offset value in millimeters. The minimum value is -1024mm and maximum is 1023mm.
-    pub fn set_offset(&mut self, offset: i16) -> Result<(), Error<B::Error>> {
-        self.write_u16(VL53L4ED_RANGE_OFFSET_MM, (offset * 4) as u16)?;
+    pub fn set_offset(&mut self, offset: Offset) -> Result<(), Error<B::Error>> {
+        self.write_u16(VL53L4ED_RANGE_OFFSET_MM, (offset.0 * 4) as u16)?;
         self.write_u16(VL53L4ED_INNER_OFFSET_MM, 0)?;
         self.write_u16(VL53L4ED_OUTER_OFFSET_MM, 0)?;
 
@@ -198,11 +256,11 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// # Returns
     /// 
     /// * `xtalk` : Current xtalk value in kcps. 
-    pub fn get_xtalk(&mut self) -> Result<u16, Error<B::Error>> {
-        let mut offset: u16 = self.read_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS)?;
-        offset = (offset as f32 / 512.0) as u16;
+    pub fn get_xtalk(&mut self) -> Result<Xtalk, Error<B::Error>> {
+        let mut xtalk: u16 = self.read_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS)?;
+        xtalk = (xtalk as f32 / 512.0) as u16;
         
-        Ok(offset)
+        Ok(Xtalk {0: xtalk})
     }
 
     /// This function sets a new Xtalk value in kcps. Xtalk represents the correction to apply to the sensor when a protective coverglass is placed at the top of the sensor.
@@ -210,10 +268,10 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     /// # Arguments
     /// 
     /// * `xtalk` : New xtalk value in kcps. The default value is 0 kcps (no coverglass). Minimum is 0 kcps , and maximum is 128 kcps.
-    pub fn set_xtalk(&mut self, xtalk: u16) -> Result<(), Error<B::Error>> {
+    pub fn set_xtalk(&mut self, xtalk: Xtalk) -> Result<(), Error<B::Error>> {
         self.write_u16(VL53L4ED_XTALK_X_PLANE_GRADIENT_KCPS, 0)?;
         self.write_u16(VL53L4ED_XTALK_Y_PLANE_GRADIENT_KCPS, 0)?;
-        self.write_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS, xtalk << 9)?;
+        self.write_u16(VL53L4ED_XTALK_PLANE_OFFSET_KCPS, xtalk.0 << 9)?;
         Ok(())
     }
 
@@ -308,27 +366,27 @@ impl<B: BusOperation, XST: OutputPin, T: DelayNs> Vl53l4ed<B, XST, T> {
     }
 
     /// This function can be called when the temperature might have changed by more than 8 degrees Celsius. The function can only be used if the sensor is not ranging, otherwise, the ranging needs to be stopped using function 'stop_ranging()'. After calling this function, the ranging can restart normally.
-    pub fn start_temperature_update(&mut self) -> Result<(), Error<B::Error>> {
+    pub fn start_temperature_update(mut self) -> Result<Vl53l4ed<Initialized, B, XST, T>, Error<B::Error>> {
         self.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x81)?;
         self.write_u8(0x0b, 0x92)?;
         // self.write_u8(VL53L4ED_SYSTEM_START, 0x40)?;
-        self.start_ranging()?;
+        let mut s = self.start_ranging()?;
         let mut i: u16 = 0;
         loop {
-            if self.check_data_ready()? { // Data ready
+            if s.check_data_ready()? { // Data ready
                 break;
             }
             if i >= 1000 {
                 return Err(Error::Timeout);
             }
-            self.delay(1);
+            s.delay(1);
             i += 1;
         }
-        self.clear_interrupt()?;
-        self.stop_ranging()?;
-        self.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09)?;
-        self.write_u8(0x0b, 0x0)?;
+        s.clear_interrupt()?;
+        let mut s = s.stop_ranging()?;
+        s.write_u8(VL53L4ED_VHV_CONFIG_TIMEOUT_MACROP_LOOP_BOUND, 0x09)?;
+        s.write_u8(0x0b, 0x0)?;
         
-        Ok(())
+        Ok(s)
     }
 }
