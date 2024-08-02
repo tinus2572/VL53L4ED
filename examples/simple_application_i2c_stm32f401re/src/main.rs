@@ -95,7 +95,6 @@ fn main() -> ! {
 
     sensor_top.init_sensor(address).unwrap(); 
     sensor_top.set_range_timing(10, 0).unwrap();
-    let _r = sensor_top.get_range_timing().unwrap();
     sensor_top.start_ranging().unwrap();
 
     loop {
