@@ -113,11 +113,9 @@ pub struct Uninitialized;
 pub struct Initialized;
 pub struct Ranging;
 
-use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
 
 // Define the Sensor with a state
-struct Vl53l4ed<State, B: BusOperation, XST: OutputPin, T: DelayNs> {
+pub struct Vl53l4ed<State, B: BusOperation, XST: OutputPin, T: DelayNs> {
     data: Box<Vl53l4edData<B, XST, T>>,
     state: PhantomData<State>,
 }

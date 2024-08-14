@@ -5,13 +5,14 @@ use vl53l4ed::{
     consts::VL53L4ED_DEFAULT_I2C_ADDRESS,
     Vl53l4ed, 
     ResultsData,
-    bus_operation::Vl53l4edI2C
+    accessors::{RangeTiming, TimingBudgetMs, Bounded},
 };
 
 use panic_halt as _; 
 use cortex_m_rt::entry;
+use embedded_alloc::Heap;
 
-use core::{fmt::Write, cell::RefCell};
+use core::{fmt::Write, cell::RefCell, mem::MaybeUninit};
 
 use embedded_hal::i2c::SevenBitAddress;
 
@@ -49,8 +50,17 @@ fn write_results(tx: &mut Tx<USART2>, results: &ResultsData) {
         sig = results.signal_per_spad_kcps).unwrap();
 }
 
+
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+const HEAP_SIZE: usize = 1024;
+static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+
 #[entry]
 fn main() -> ! {
+    unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+
     let mut results: ResultsData;
     
     let dp: Peripherals = Peripherals::take().unwrap();
@@ -87,16 +97,19 @@ fn main() -> ! {
     let i2c_bus: RefCell<StmI2c<I2C1>> = RefCell::new(i2c);
     let address: SevenBitAddress = VL53L4ED_DEFAULT_I2C_ADDRESS;
         
-    let mut sensor_top: Vl53l4ed<Vl53l4edI2C<RefCellDevice<StmI2c<I2C1>>>, Pin<'B', 3, Output>, Delay<TIM1, 1000>> = Vl53l4ed::new_i2c(
+    let sensor_top = Vl53l4ed::new_i2c(
         RefCellDevice::new(&i2c_bus),  
             xshut_pin,
             tim_top
         ).unwrap();
 
-    sensor_top.init_sensor(address).unwrap(); 
-    sensor_top.set_range_timing(10, 0).unwrap();
-    let _r = sensor_top.get_range_timing().unwrap();
-    sensor_top.start_ranging().unwrap();
+    let mut sensor_top = sensor_top.init_sensor(address).unwrap(); 
+    
+    let t: TimingBudgetMs = TimingBudgetMs::new(10).expect("");
+    let r: RangeTiming = RangeTiming {timing_budget_ms: t, inter_measurement_ms: 0};
+
+    sensor_top.set_range_timing(r).unwrap();
+    let mut sensor_top = sensor_top.start_ranging().unwrap();
 
     loop {
         while !sensor_top.check_data_ready().unwrap() {} // Wait for data to be ready
@@ -106,3 +119,4 @@ fn main() -> ! {
     }
 
 } 
+

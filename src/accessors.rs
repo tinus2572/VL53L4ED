@@ -1,10 +1,9 @@
-use core::iter::OnceWith;
 
 use consts::*;
 use stm32f4xx_hal::{pac::tim11::or::OR_SPEC, rtc::Lse};
 use utils::*;
 
-use crate::{consts, utils, BusOperation, Initialized, Vl53l4ed, Error, OutputPin, DelayNs, FromPrimitive};
+use crate::{consts, utils, BusOperation, Initialized, Vl53l4ed, Error, OutputPin, DelayNs};
 
 #[repr(u8)]
 pub enum ThresholdWindow {
@@ -35,7 +34,10 @@ pub struct RangeTiming {
     pub inter_measurement_ms: u32
 }
 
-#[derive(Debug, Clone, Copy, FromPrimitive, PartialEq)]
+extern crate num_traits;
+extern crate num_derive;
+
+#[derive(Debug, Clone, Copy, num_derive::FromPrimitive, PartialEq)]
 pub struct TimingBudgetMs(u32);
 
 pub struct Offset(i16);
